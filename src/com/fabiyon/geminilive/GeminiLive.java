@@ -13,6 +13,9 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import android.util.Base64;
+import android.media.AudioFormat;
+import android.media.AudioManager;
+import android.media.AudioTrack;
 
 @DesignerComponent(version=1, description="Direct Gemini Live WebSocket client for Kodular. No proxy server required.", category=ComponentCategory.EXTENSION, nonVisible=true, iconName="")
 @SimpleObject(external=true)
@@ -22,6 +25,10 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   private SSLSocket socket; private InputStream in; private OutputStream out;
   private volatile boolean connected=false, ready=false; private Thread reader;
   private String model="gemini-3.8-live";
+  private volatile boolean audioEnabled=true;
+  private volatile float volume=1.0f;
+  private AudioTrack audioTrack;
+  private final Object audioLock=new Object();
 
   public GeminiLive(ComponentContainer container){ super(container.$form()); }
 
@@ -84,6 +91,30 @@ public class GeminiLive extends AndroidNonvisibleComponent {
       }
     }},"GeminiLive-sendText").start();
   }
+
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR, description="Play Gemini PCM audio responses through the device speaker.")
+  public boolean AudioEnabled(){ return audioEnabled; }
+  @DesignerProperty(editorType="boolean", defaultValue="True")
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR)
+  public void AudioEnabled(boolean value){ audioEnabled=value; if(!value) StopAudio(); }
+
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR, description="Playback volume from 0 to 100.")
+  public int Volume(){ return Math.round(volume*100f); }
+  @DesignerProperty(editorType="integer", defaultValue="100")
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR)
+  public void Volume(int value){
+    if(value<0)value=0; if(value>100)value=100;
+    volume=value/100f;
+    synchronized(audioLock){ if(audioTrack!=null) audioTrack.setStereoVolume(volume,volume); }
+  }
+
+  @SimpleFunction(description="Immediately stop and flush buffered Gemini audio.")
+  public void StopAudio(){
+    new Thread(new Runnable(){ public void run(){ flushAudio(); }},"GeminiLive-stopAudio").start();
+  }
+
+  @SimpleEvent public void OutputTranscription(String text){ EventDispatcher.dispatchEvent(this,"OutputTranscription",text); }
+  @SimpleEvent public void TurnComplete(){ EventDispatcher.dispatchEvent(this,"TurnComplete"); }
 
   @SimpleFunction public boolean IsConnected(){ return connected; }
   @SimpleFunction public boolean IsReady(){ return ready; }
@@ -170,14 +201,76 @@ public class GeminiLive extends AndroidNonvisibleComponent {
         JSONObject sc=j.getJSONObject("serverContent");
         if(sc.has("modelTurn")){
           org.json.JSONArray ps=sc.getJSONObject("modelTurn").optJSONArray("parts");
-          if(ps!=null) { for(int i=0;i<ps.length();i++){ String t=ps.getJSONObject(i).optString("text",""); if(!t.isEmpty()) { final String textPart=t; ui.post(new Runnable() { public void run() { TextReceived(textPart); }}); } } }
+          if(ps!=null) {
+            for(int i=0;i<ps.length();i++){
+              JSONObject p=ps.getJSONObject(i);
+              String t=p.optString("text","");
+              if(!t.isEmpty()) {
+                final String textPart=t;
+                ui.post(new Runnable() { public void run() { TextReceived(textPart); }});
+              }
+              JSONObject inline=p.optJSONObject("inlineData");
+              if(inline!=null && inline.optString("mimeType","").startsWith("audio/pcm")){
+                String b64=inline.optString("data","");
+                if(!b64.isEmpty() && audioEnabled){
+                  try { playPcm(Base64.decode(b64,Base64.DEFAULT)); }
+                  catch(Exception ae){ Error("Audio: "+ae.toString()); }
+                }
+              }
+            }
+          }
         }
+        JSONObject tr=sc.optJSONObject("outputTranscription");
+        if(tr!=null){
+          final String tx=tr.optString("text","");
+          if(!tx.isEmpty()) ui.post(new Runnable(){ public void run(){ OutputTranscription(tx); }});
+        }
+        if(sc.optBoolean("interrupted",false)) flushAudio();
+        if(sc.optBoolean("turnComplete",false)) ui.post(new Runnable(){ public void run(){ TurnComplete(); }});
       }
     } catch(Exception ignored){}
   }
 
+  private void ensureAudioTrack(){
+    synchronized(audioLock){
+      if(audioTrack!=null) return;
+      int min=AudioTrack.getMinBufferSize(24000,AudioFormat.CHANNEL_OUT_MONO,AudioFormat.ENCODING_PCM_16BIT);
+      int buffer=Math.max(min,2400);
+      audioTrack=new AudioTrack(AudioManager.STREAM_MUSIC,24000,AudioFormat.CHANNEL_OUT_MONO,
+        AudioFormat.ENCODING_PCM_16BIT,buffer,AudioTrack.MODE_STREAM);
+      audioTrack.setStereoVolume(volume,volume);
+      audioTrack.play();
+    }
+  }
+
+  private void playPcm(byte[] pcm){
+    if(!audioEnabled || pcm==null || pcm.length==0) return;
+    ensureAudioTrack();
+    synchronized(audioLock){
+      if(audioTrack!=null) audioTrack.write(pcm,0,pcm.length);
+    }
+  }
+
+  private void flushAudio(){
+    synchronized(audioLock){
+      if(audioTrack!=null){
+        try { audioTrack.pause(); audioTrack.flush(); if(audioEnabled) audioTrack.play(); } catch(Exception ignored){}
+      }
+    }
+  }
+
+  private void releaseAudio(){
+    synchronized(audioLock){
+      if(audioTrack!=null){
+        try { audioTrack.pause(); audioTrack.flush(); audioTrack.release(); } catch(Exception ignored){}
+        audioTrack=null;
+      }
+    }
+  }
+
   private synchronized void closeQuietly(){
     ready=false; connected=false;
+    releaseAudio();
     try{ if(socket!=null) socket.close(); }catch(Exception ignored){}
     socket=null; in=null; out=null;
   }
