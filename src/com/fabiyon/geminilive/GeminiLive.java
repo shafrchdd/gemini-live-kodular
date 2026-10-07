@@ -66,21 +66,23 @@ public class GeminiLive extends AndroidNonvisibleComponent {
     }},"GeminiLive-connect").start();
   }
 
-  @SimpleFunction public void SendText(String text){
+  @SimpleFunction public void SendText(final String text){
     if(!ready){ Error("Gemini is not ready. Wait for SetupComplete."); return; }
-    try {
-      JSONObject part=new JSONObject().put("text",text);
-      org.json.JSONArray parts=new org.json.JSONArray().put(part);
-      JSONObject content=new JSONObject().put("role","user").put("parts",parts);
-      org.json.JSONArray turns=new org.json.JSONArray().put(content);
-      JSONObject tc=new JSONObject().put("turns",turns).put("turnComplete",true);
-      JSONObject root=new JSONObject().put("clientContent",tc);
-      sendFrame(root.toString());
-    } catch(Exception e){
-      String detail=e.toString();
-      if(e.getMessage()!=null) detail += " | " + e.getMessage();
-      Error("SendText: "+detail);
-    }
+    new Thread(new Runnable() { public void run() {
+      try {
+        JSONObject part=new JSONObject().put("text",text);
+        org.json.JSONArray parts=new org.json.JSONArray().put(part);
+        JSONObject content=new JSONObject().put("role","user").put("parts",parts);
+        org.json.JSONArray turns=new org.json.JSONArray().put(content);
+        JSONObject tc=new JSONObject().put("turns",turns).put("turnComplete",true);
+        JSONObject root=new JSONObject().put("clientContent",tc);
+        sendFrame(root.toString());
+      } catch(Exception e){
+        String detail=e.toString();
+        if(e.getMessage()!=null) detail += " | " + e.getMessage();
+        Error("SendText: "+detail);
+      }
+    }},"GeminiLive-sendText").start();
   }
 
   @SimpleFunction public boolean IsConnected(){ return connected; }
