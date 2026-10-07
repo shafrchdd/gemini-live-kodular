@@ -76,7 +76,11 @@ public class GeminiLive extends AndroidNonvisibleComponent {
       JSONObject tc=new JSONObject().put("turns",turns).put("turnComplete",true);
       JSONObject root=new JSONObject().put("clientContent",tc);
       sendFrame(root.toString());
-    } catch(Exception e){ Error("SendText: "+e.getMessage()); }
+    } catch(Exception e){
+      String detail=e.toString();
+      if(e.getMessage()!=null) detail += " | " + e.getMessage();
+      Error("SendText: "+detail);
+    }
   }
 
   @SimpleFunction public boolean IsConnected(){ return connected; }
@@ -127,7 +131,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
           else { fragmented.append(chunk); if(fin){ handleMessage(fragmented.toString()); fragmented.setLength(0); } }
         }
       }
-    } catch(Exception e){ if(connected) Error("Read: "+e.getMessage()); }
+    } catch(Exception e){ if(connected) Error("Read: "+e.toString()); }
     finally { boolean was=connected; closeQuietly(); if(was) ui.post(new Runnable() { public void run() { Disconnected("Socket closed"); }}); }
   }
 
