@@ -136,7 +136,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
         JSONObject sc=j.getJSONObject("serverContent");
         if(sc.has("modelTurn")){
           org.json.JSONArray ps=sc.getJSONObject("modelTurn").optJSONArray("parts");
-          if(ps!=null) for(int i=0;i<ps.length();i++){ String t=ps.getJSONObject(i).optString("text",""); if(!t.isEmpty()) final String textPart=t; ui.post(new Runnable() { public void run() { TextReceived(textPart); }}); }
+          if(ps!=null) { for(int i=0;i<ps.length();i++){ String t=ps.getJSONObject(i).optString("text",""); if(!t.isEmpty()) { final String textPart=t; ui.post(new Runnable() { public void run() { TextReceived(textPart); }}); } } }
         }
       }
     } catch(Exception ignored){}
