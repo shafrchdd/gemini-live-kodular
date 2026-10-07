@@ -1,0 +1,28 @@
+name: Build Gemini Live AIX
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AIX
+        id: build
+        uses: pavi2410/AIX-Action@main
+        with:
+          source-dir: src
+          package-name: com.fabiyon.geminilive
+      - name: Validate output
+        run: |
+          test -f "${{ steps.build.outputs.extension-path }}"
+          unzip -t "${{ steps.build.outputs.extension-path }}"
+          unzip -l "${{ steps.build.outputs.extension-path }}"
+      - name: Upload AIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeminiLive-Kodular-AIX
+          path: ${{ steps.build.outputs.extension-path }}
