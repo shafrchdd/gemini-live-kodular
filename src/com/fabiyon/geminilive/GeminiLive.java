@@ -12,7 +12,7 @@ import java.io.*;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
-import java.util.Base64;
+import android.util.Base64;
 
 @DesignerComponent(version=1, description="Direct Gemini Live WebSocket client for Kodular. No proxy server required.", category=ComponentCategory.EXTENSION, nonVisible=true, iconName="")
 @SimpleObject(external=true)
@@ -45,9 +45,11 @@ public class GeminiLive extends AndroidNonvisibleComponent {
           "Host: "+uri.getHost()+"\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"+
           "Sec-WebSocket-Key: "+key+"\r\nSec-WebSocket-Version: 13\r\n\r\n";
         out.write(req.getBytes(StandardCharsets.US_ASCII)); out.flush();
-        BufferedReader br=new BufferedReader(new InputStreamReader(in,StandardCharsets.US_ASCII));
-        String status=br.readLine(); if(status==null || !status.contains(" 101 ")) throw new IOException("WebSocket handshake failed: "+status);
-        String line; while((line=br.readLine())!=null && !line.isEmpty()){}
+        String headers=readHttpHeaders();
+        String firstLine=headers;
+        int firstEnd=headers.indexOf("\r\n");
+        if(firstEnd>=0) firstLine=headers.substring(0,firstEnd);
+        if(!firstLine.contains(" 101 ")) throw new IOException("WebSocket handshake failed: "+firstLine);
         connected=true; fireConnected();
         reader=new Thread(new Runnable() { public void run() { readLoop(); }}); reader.start();
         JSONObject setup=new JSONObject(); JSONObject body=new JSONObject();
@@ -90,7 +92,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   @SimpleEvent public void Disconnected(String reason){ EventDispatcher.dispatchEvent(this,"Disconnected",reason); }
 
   private void fireConnected(){ ui.post(new Runnable() { public void run() { Connected(); }}); }
-  private String makeKey(){ byte[] b=new byte[16]; new SecureRandom().nextBytes(b); return Base64.getEncoder().encodeToString(b); }
+  private String makeKey(){ byte[] b=new byte[16]; new SecureRandom().nextBytes(b); return Base64.encodeToString(b,Base64.NO_WRAP); }
 
   private synchronized void sendFrame(String s) throws IOException {
     if(!connected || out==null) throw new IOException("Not connected");
@@ -124,6 +126,22 @@ public class GeminiLive extends AndroidNonvisibleComponent {
       }
     } catch(Exception e){ if(connected) Error("Read: "+e.getMessage()); }
     finally { boolean was=connected; closeQuietly(); if(was) ui.post(new Runnable() { public void run() { Disconnected("Socket closed"); }}); }
+  }
+
+  private String readHttpHeaders() throws IOException {
+    ByteArrayOutputStream b=new ByteArrayOutputStream();
+    int state=0;
+    while(b.size()<32768){
+      int x=in.read(); if(x<0) throw new EOFException("EOF during WebSocket handshake");
+      b.write(x);
+      if(state==0) state=(x=='\r')?1:0;
+      else if(state==1) state=(x=='\n')?2:0;
+      else if(state==2) state=(x=='\r')?3:0;
+      else if(state==3 && x=='\n') break;
+      else state=0;
+    }
+    if(state!=3) throw new IOException("WebSocket response headers too large");
+    return new String(b.toByteArray(),StandardCharsets.US_ASCII);
   }
 
   private int readByte() throws IOException { int x=in.read(); if(x<0) throw new EOFException(); return x; }
