@@ -25,10 +25,10 @@ public class GeminiLive extends AndroidNonvisibleComponent {
 
   public GeminiLive(ComponentContainer container){ super(container.$form()); }
 
-  @SimpleProperty(description="Gemini Live model name.")
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR, description="Gemini Live model name.")
   public String Model(){ return model; }
   @DesignerProperty(editorType="string", defaultValue="gemini-3.8-live")
-  @SimpleProperty
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR)
   public void Model(String value){ if(value!=null && !value.trim().isEmpty()) model=value.trim(); }
 
   @SimpleFunction(description="Connect directly to Gemini Live with an API key.")
