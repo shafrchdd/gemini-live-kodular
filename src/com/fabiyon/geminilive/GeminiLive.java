@@ -37,7 +37,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
     Disconnect();
     new Thread(new Runnable() { public void run() {
       try {
-        URI uri=new URI("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key="+apiKey.trim());
+        URI uri=new URI("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key="+apiKey.trim());
         socket=(SSLSocket)SSLSocketFactory.getDefault().createSocket(uri.getHost(),443);
         socket.startHandshake(); in=socket.getInputStream(); out=socket.getOutputStream();
         String key=makeKey();
@@ -51,7 +51,14 @@ public class GeminiLive extends AndroidNonvisibleComponent {
         connected=true; fireConnected();
         reader=new Thread(new Runnable() { public void run() { readLoop(); }}); reader.start();
         JSONObject setup=new JSONObject(); JSONObject body=new JSONObject();
-        body.put("model","models/"+model); setup.put("setup",body);
+        body.put("model","models/"+model);
+        org.json.JSONArray modalities=new org.json.JSONArray(); modalities.put("AUDIO");
+        JSONObject prebuilt=new JSONObject(); prebuilt.put("voiceName","Puck");
+        JSONObject voiceConfig=new JSONObject(); voiceConfig.put("prebuiltVoiceConfig",prebuilt);
+        JSONObject speechConfig=new JSONObject(); speechConfig.put("voiceConfig",voiceConfig);
+        JSONObject generationConfig=new JSONObject(); generationConfig.put("responseModalities",modalities); generationConfig.put("speechConfig",speechConfig);
+        body.put("generationConfig",generationConfig);
+        setup.put("setup",body);
         sendFrame(setup.toString()); SetupSent(setup.toString());
       } catch(Exception e){ Error("Connect/setup: "+e.getMessage()); closeQuietly(); }
     }},"GeminiLive-connect").start();
