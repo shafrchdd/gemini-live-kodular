@@ -118,9 +118,12 @@ public class GeminiLive extends AndroidNonvisibleComponent {
         byte[] data=readN((int)len); if(mask!=null) for(int i=0;i<data.length;i++) data[i]^=mask[i&3];
         if(opcode==8){ break; }
         if(opcode==9){ sendControl(10,data); continue; }
-        if(opcode==1 || opcode==0){
+        // Gemini Live may return JSON in either TEXT (opcode 1) or BINARY
+        // (opcode 2) WebSocket frames. The Python reference client receives
+        // setupComplete/serverContent as bytes, so decode binary JSON as UTF-8.
+        if(opcode==1 || opcode==2 || opcode==0){
           String chunk=new String(data,StandardCharsets.UTF_8);
-          if(opcode==1 && fin) handleMessage(chunk);
+          if((opcode==1 || opcode==2) && fin) handleMessage(chunk);
           else { fragmented.append(chunk); if(fin){ handleMessage(fragmented.toString()); fragmented.setLength(0); } }
         }
       }
