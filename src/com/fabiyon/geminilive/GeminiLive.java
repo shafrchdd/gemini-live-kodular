@@ -16,15 +16,29 @@ import android.util.Base64;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
+import com.google.appinventor.components.runtime.util.YailList;
+import com.google.appinventor.components.runtime.PermissionResultHandler;
+import java.net.URL;
+import java.net.HttpURLConnection;
+import java.util.ArrayList;
 
 @DesignerComponent(version=1, description="Direct Gemini Live WebSocket client for Kodular. No proxy server required.", category=ComponentCategory.EXTENSION, nonVisible=true, iconName="")
 @SimpleObject(external=true)
-@UsesPermissions(permissionNames="android.permission.INTERNET")
+@UsesPermissions(permissionNames="android.permission.INTERNET, android.permission.RECORD_AUDIO")
 public class GeminiLive extends AndroidNonvisibleComponent {
   private final Handler ui = new Handler(Looper.getMainLooper());
   private SSLSocket socket; private InputStream in; private OutputStream out;
   private volatile boolean connected=false, ready=false; private Thread reader;
   private String model="gemini-3.8-live";
+  private String voice="Puck";
+  private String systemInstruction="";
+  private String apiKey="";
+  private final org.json.JSONArray functionDeclarations=new org.json.JSONArray();
+  private volatile boolean listening=false;
+  private AudioRecord audioRecord;
+  private Thread micThread;
   private volatile boolean audioEnabled=true;
   private volatile float volume=1.0f;
   private AudioTrack audioTrack;
@@ -38,9 +52,87 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   @SimpleProperty(category=PropertyCategory.BEHAVIOR)
   public void Model(String value){ if(value!=null && !value.trim().isEmpty()) model=value.trim(); }
 
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR, description="Gemini prebuilt voice name used for the next connection.")
+  public String Voice(){ return voice; }
+  @DesignerProperty(editorType="string", defaultValue="Puck")
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR)
+  public void Voice(String value){ if(value!=null && !value.trim().isEmpty()) voice=value.trim(); }
+
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR, description="System instruction sent when the next Live session connects.")
+  public String SystemInstruction(){ return systemInstruction; }
+  @DesignerProperty(editorType="textArea", defaultValue="")
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR)
+  public void SystemInstruction(String value){ systemInstruction=value==null?"":value; }
+
+  @SimpleFunction(description="Fetch models available to this API key. Use ModelsLoaded to fill a Spinner/ListPicker dynamically.")
+  public void RefreshModels(final String key){ fetchCatalog(key,true); }
+
+  @SimpleFunction(description="Fetch voices available to this API key. Use VoicesLoaded to fill a Spinner/ListPicker dynamically.")
+  public void RefreshVoices(final String key){ fetchCatalog(key,false); }
+
+  @SimpleEvent public void ModelsLoaded(YailList models){ EventDispatcher.dispatchEvent(this,"ModelsLoaded",models); }
+  @SimpleEvent public void VoicesLoaded(YailList voices){ EventDispatcher.dispatchEvent(this,"VoicesLoaded",voices); }
+
+  @SimpleFunction(description="Remove all function declarations that will be sent on the next connection.")
+  public void ClearFunctions(){ while(functionDeclarations.length()>0) functionDeclarations.remove(0); }
+
+  @SimpleFunction(description="Add a Gemini function. parametersJson must be a JSON Schema object, for example {\"type\":\"object\",\"properties\":{}}. Add functions before Connect.")
+  public void AddFunction(String name,String description,String parametersJson){
+    try{
+      JSONObject d=new JSONObject().put("name",name).put("description",description==null?"":description);
+      if(parametersJson!=null && !parametersJson.trim().isEmpty()) d.put("parameters",new JSONObject(parametersJson));
+      functionDeclarations.put(d);
+    }catch(Exception e){ Error("AddFunction: "+e.toString()); }
+  }
+
+  @SimpleEvent public void FunctionCall(String name,String argumentsJson,String callId){
+    EventDispatcher.dispatchEvent(this,"FunctionCall",name,argumentsJson,callId);
+  }
+
+  @SimpleFunction(description="Return the result of a requested function to Gemini.")
+  public void SendFunctionResult(final String callId,final String name,final String resultJson){
+    if(!ready){ Error("Gemini is not ready."); return; }
+    new Thread(new Runnable(){ public void run(){
+      try{
+        JSONObject response;
+        try{ response=new JSONObject(resultJson); }catch(Exception x){ response=new JSONObject().put("result",resultJson); }
+        JSONObject fr=new JSONObject().put("id",callId).put("name",name).put("response",response);
+        org.json.JSONArray arr=new org.json.JSONArray().put(fr);
+        sendFrame(new JSONObject().put("toolResponse",new JSONObject().put("functionResponses",arr)).toString());
+      }catch(Exception e){ Error("SendFunctionResult: "+e.toString()); }
+    }},"GeminiLive-toolResult").start();
+  }
+
+  @SimpleFunction(description="Start low-latency microphone streaming (16 kHz mono PCM16) to Gemini. Android microphone permission is requested automatically.")
+  public void StartListening(){
+    if(!ready){ Error("Gemini is not ready."); return; }
+    form.askPermission("android.permission.RECORD_AUDIO",new PermissionResultHandler(){
+      public void HandlePermissionResponse(String permission,boolean granted){
+        if(granted) startMicInternal(); else Error("Microphone permission denied");
+      }
+    });
+  }
+
+  @SimpleFunction(description="Stop microphone streaming and signal end of the audio stream.")
+  public void StopListening(){
+    listening=false;
+    try{ if(audioRecord!=null) audioRecord.stop(); }catch(Exception ignored){}
+    audioRecord=null;
+    if(ready) new Thread(new Runnable(){ public void run(){
+      try{ sendFrame(new JSONObject().put("realtimeInput",new JSONObject().put("audioStreamEnd",true)).toString()); }
+      catch(Exception e){ Error("StopListening: "+e.toString()); }
+    }},"GeminiLive-audioEnd").start();
+  }
+
+  @SimpleFunction public boolean IsListening(){ return listening; }
+  @SimpleEvent public void ListeningStarted(){ EventDispatcher.dispatchEvent(this,"ListeningStarted"); }
+  @SimpleEvent public void ListeningStopped(){ EventDispatcher.dispatchEvent(this,"ListeningStopped"); }
+  @SimpleEvent public void InputTranscription(String text){ EventDispatcher.dispatchEvent(this,"InputTranscription",text); }
+
   @SimpleFunction(description="Connect directly to Gemini Live with an API key.")
   public void Connect(final String apiKey){
     if(apiKey==null || apiKey.trim().isEmpty()){ Error("API key is empty"); return; }
+    this.apiKey=apiKey.trim();
     Disconnect();
     new Thread(new Runnable() { public void run() {
       try {
@@ -62,11 +154,21 @@ public class GeminiLive extends AndroidNonvisibleComponent {
         JSONObject setup=new JSONObject(); JSONObject body=new JSONObject();
         body.put("model","models/"+model);
         org.json.JSONArray modalities=new org.json.JSONArray(); modalities.put("AUDIO");
-        JSONObject prebuilt=new JSONObject(); prebuilt.put("voiceName","Puck");
+        JSONObject prebuilt=new JSONObject(); prebuilt.put("voiceName",voice);
         JSONObject voiceConfig=new JSONObject(); voiceConfig.put("prebuiltVoiceConfig",prebuilt);
         JSONObject speechConfig=new JSONObject(); speechConfig.put("voiceConfig",voiceConfig);
         JSONObject generationConfig=new JSONObject(); generationConfig.put("responseModalities",modalities); generationConfig.put("speechConfig",speechConfig);
         body.put("generationConfig",generationConfig);
+        if(!systemInstruction.trim().isEmpty()){
+          JSONObject sip=new JSONObject().put("text",systemInstruction);
+          body.put("systemInstruction",new JSONObject().put("parts",new org.json.JSONArray().put(sip)));
+        }
+        if(functionDeclarations.length()>0){
+          JSONObject tool=new JSONObject().put("functionDeclarations",new org.json.JSONArray(functionDeclarations.toString()));
+          body.put("tools",new org.json.JSONArray().put(tool));
+        }
+        body.put("inputAudioTranscription",new JSONObject());
+        body.put("outputAudioTranscription",new JSONObject());
         setup.put("setup",body);
         sendFrame(setup.toString()); SetupSent(setup.toString());
       } catch(Exception e){ Error("Connect/setup: "+e.getMessage()); closeQuietly(); }
@@ -197,6 +299,18 @@ public class GeminiLive extends AndroidNonvisibleComponent {
     try {
       JSONObject j=new JSONObject(msg);
       if(j.has("setupComplete")){ ready=true; ui.post(new Runnable() { public void run() { SetupComplete(); }}); return; }
+      if(j.has("toolCall")){
+        JSONObject tc=j.getJSONObject("toolCall");
+        org.json.JSONArray calls=tc.optJSONArray("functionCalls");
+        if(calls!=null) for(int i=0;i<calls.length();i++){
+          JSONObject fc=calls.getJSONObject(i);
+          final String fn=fc.optString("name","");
+          final String fid=fc.optString("id","");
+          Object args=fc.opt("args");
+          final String fa=args==null?"{}":args.toString();
+          ui.post(new Runnable(){ public void run(){ FunctionCall(fn,fa,fid); }});
+        }
+      }
       if(j.has("serverContent")){
         JSONObject sc=j.getJSONObject("serverContent");
         if(sc.has("modelTurn")){
@@ -220,7 +334,13 @@ public class GeminiLive extends AndroidNonvisibleComponent {
             }
           }
         }
+        JSONObject itr=sc.optJSONObject("inputTranscription");
+        if(itr!=null){
+          final String itx=itr.optString("text","");
+          if(!itx.isEmpty()) ui.post(new Runnable(){ public void run(){ InputTranscription(itx); }});
+        }
         JSONObject tr=sc.optJSONObject("outputTranscription");
+        if(tr==null) tr=sc.optJSONObject("outputAudioTranscription");
         if(tr!=null){
           final String tx=tr.optString("text","");
           if(!tx.isEmpty()) ui.post(new Runnable(){ public void run(){ OutputTranscription(tx); }});
@@ -229,6 +349,71 @@ public class GeminiLive extends AndroidNonvisibleComponent {
         if(sc.optBoolean("turnComplete",false)) ui.post(new Runnable(){ public void run(){ TurnComplete(); }});
       }
     } catch(Exception ignored){}
+  }
+
+  private void startMicInternal(){
+    if(listening) return;
+    try{
+      int min=AudioRecord.getMinBufferSize(16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);
+      final int size=Math.max(min,3200);
+      audioRecord=new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION,16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,size*2);
+      if(audioRecord.getState()!=AudioRecord.STATE_INITIALIZED) throw new IOException("AudioRecord initialization failed");
+      listening=true; audioRecord.startRecording();
+      ui.post(new Runnable(){ public void run(){ ListeningStarted(); }});
+      micThread=new Thread(new Runnable(){ public void run(){
+        byte[] buf=new byte[size];
+        try{
+          while(listening && ready && audioRecord!=null){
+            int n=audioRecord.read(buf,0,buf.length);
+            if(n>0){
+              byte[] chunk=new byte[n]; System.arraycopy(buf,0,chunk,0,n);
+              JSONObject blob=new JSONObject().put("data",Base64.encodeToString(chunk,Base64.NO_WRAP)).put("mimeType","audio/pcm;rate=16000");
+              sendFrame(new JSONObject().put("realtimeInput",new JSONObject().put("audio",blob)).toString());
+            }
+          }
+        }catch(Exception e){ if(listening) Error("Microphone: "+e.toString()); }
+        finally{
+          listening=false;
+          try{ if(audioRecord!=null) audioRecord.release(); }catch(Exception ignored){}
+          audioRecord=null;
+          ui.post(new Runnable(){ public void run(){ ListeningStopped(); }});
+        }
+      }},"GeminiLive-microphone"); micThread.start();
+    }catch(Exception e){ listening=false; Error("StartListening: "+e.toString()); }
+  }
+
+  private void fetchCatalog(final String key,final boolean models){
+    if(key==null || key.trim().isEmpty()){ Error("API key is empty"); return; }
+    new Thread(new Runnable(){ public void run(){
+      HttpURLConnection conn=null;
+      try{
+        String endpoint=models?"https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key=":
+          "https://generativelanguage.googleapis.com/v1beta/voices?page_size=1000&key=";
+        conn=(HttpURLConnection)new URL(endpoint+java.net.URLEncoder.encode(key.trim(),"UTF-8")).openConnection();
+        conn.setConnectTimeout(10000); conn.setReadTimeout(15000); conn.setRequestMethod("GET");
+        InputStream s=conn.getResponseCode()>=200&&conn.getResponseCode()<300?conn.getInputStream():conn.getErrorStream();
+        BufferedReader r=new BufferedReader(new InputStreamReader(s,StandardCharsets.UTF_8));
+        StringBuilder b=new StringBuilder(); String line; while((line=r.readLine())!=null)b.append(line);
+        if(conn.getResponseCode()<200||conn.getResponseCode()>=300) throw new IOException("HTTP "+conn.getResponseCode()+": "+b.toString());
+        JSONObject root=new JSONObject(b.toString()); final ArrayList<String> vals=new ArrayList<String>();
+        org.json.JSONArray a=root.optJSONArray(models?"models":"voices");
+        if(a!=null) for(int i=0;i<a.length();i++){
+          JSONObject o=a.getJSONObject(i);
+          if(models){
+            String n=o.optString("name",""); if(n.startsWith("models/"))n=n.substring(7);
+            String low=n.toLowerCase();
+            if(low.contains("live")) vals.add(n);
+          }else{
+            String n=o.optString("display_name",o.optString("displayName",""));
+            if(n.isEmpty()){ n=o.optString("name",""); if(n.startsWith("voices/"))n=n.substring(7); }
+            if(!n.isEmpty()) vals.add(n);
+          }
+        }
+        final YailList yl=YailList.makeList(vals);
+        ui.post(new Runnable(){ public void run(){ if(models)ModelsLoaded(yl); else VoicesLoaded(yl); }});
+      }catch(Exception e){ Error((models?"RefreshModels: ":"RefreshVoices: ")+e.toString()); }
+      finally{ if(conn!=null)conn.disconnect(); }
+    }},"GeminiLive-catalog").start();
   }
 
   private void ensureAudioTrack(){
@@ -269,6 +454,8 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   }
 
   private synchronized void closeQuietly(){
+    listening=false;
+    try{ if(audioRecord!=null) audioRecord.stop(); }catch(Exception ignored){}
     ready=false; connected=false;
     releaseAudio();
     try{ if(socket!=null) socket.close(); }catch(Exception ignored){}
