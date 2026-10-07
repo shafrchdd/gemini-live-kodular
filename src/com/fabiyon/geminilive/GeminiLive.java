@@ -18,6 +18,8 @@ import android.media.AudioManager;
 import android.media.AudioTrack;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
+import android.media.audiofx.AcousticEchoCanceler;
+import android.media.audiofx.NoiseSuppressor;
 import com.google.appinventor.components.runtime.util.YailList;
 import com.google.appinventor.components.runtime.PermissionResultHandler;
 import java.net.URL;
@@ -39,6 +41,12 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   private volatile boolean listening=false;
   private AudioRecord audioRecord;
   private Thread micThread;
+  private AcousticEchoCanceler echoCanceler;
+  private NoiseSuppressor noiseSuppressor;
+  private volatile boolean echoCancellation=true;
+  private volatile boolean noiseSuppression=true;
+  private volatile boolean muteMicWhileSpeaking=false;
+  private volatile boolean assistantSpeaking=false;
   private volatile boolean audioEnabled=true;
   private volatile float volume=1.0f;
   private AudioTrack audioTrack;
@@ -103,6 +111,27 @@ public class GeminiLive extends AndroidNonvisibleComponent {
     }},"GeminiLive-toolResult").start();
   }
 
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR, description="Enable Android acoustic echo cancellation when supported by the device.")
+  public boolean EchoCancellation(){ return echoCancellation; }
+  @DesignerProperty(editorType="boolean", defaultValue="True")
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR)
+  public void EchoCancellation(boolean value){ echoCancellation=value; }
+
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR, description="Enable Android microphone noise suppression when supported by the device.")
+  public boolean NoiseSuppression(){ return noiseSuppression; }
+  @DesignerProperty(editorType="boolean", defaultValue="True")
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR)
+  public void NoiseSuppression(boolean value){ noiseSuppression=value; }
+
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR, description="Fallback: do not send microphone PCM while Gemini audio is playing. Prevents self-hearing but disables barge-in during playback.")
+  public boolean MuteMicWhileSpeaking(){ return muteMicWhileSpeaking; }
+  @DesignerProperty(editorType="boolean", defaultValue="False")
+  @SimpleProperty(category=PropertyCategory.BEHAVIOR)
+  public void MuteMicWhileSpeaking(boolean value){ muteMicWhileSpeaking=value; }
+
+  @SimpleFunction public boolean IsEchoCancellationAvailable(){ return AcousticEchoCanceler.isAvailable(); }
+  @SimpleFunction public boolean IsNoiseSuppressionAvailable(){ return NoiseSuppressor.isAvailable(); }
+
   @SimpleFunction(description="Start low-latency microphone streaming (16 kHz mono PCM16) to Gemini. Android microphone permission is requested automatically.")
   public void StartListening(){
     if(!ready){ Error("Gemini is not ready."); return; }
@@ -115,8 +144,11 @@ public class GeminiLive extends AndroidNonvisibleComponent {
 
   @SimpleFunction(description="Stop microphone streaming and signal end of the audio stream.")
   public void StopListening(){
-    listening=false;
+    listening=false; assistantSpeaking=false;
     try{ if(audioRecord!=null) audioRecord.stop(); }catch(Exception ignored){}
+    try{ if(echoCanceler!=null) echoCanceler.release(); }catch(Exception ignored){}
+    try{ if(noiseSuppressor!=null) noiseSuppressor.release(); }catch(Exception ignored){}
+    echoCanceler=null; noiseSuppressor=null;
     audioRecord=null;
     if(ready) new Thread(new Runnable(){ public void run(){
       try{ sendFrame(new JSONObject().put("realtimeInput",new JSONObject().put("audioStreamEnd",true)).toString()); }
@@ -345,8 +377,11 @@ public class GeminiLive extends AndroidNonvisibleComponent {
           final String tx=tr.optString("text","");
           if(!tx.isEmpty()) ui.post(new Runnable(){ public void run(){ OutputTranscription(tx); }});
         }
-        if(sc.optBoolean("interrupted",false)) flushAudio();
-        if(sc.optBoolean("turnComplete",false)) ui.post(new Runnable(){ public void run(){ TurnComplete(); }});
+        if(sc.optBoolean("interrupted",false)){ assistantSpeaking=false; flushAudio(); }
+        if(sc.optBoolean("turnComplete",false)){
+          assistantSpeaking=false;
+          ui.post(new Runnable(){ public void run(){ TurnComplete(); }});
+        }
       }
     } catch(Exception ignored){}
   }
@@ -356,7 +391,13 @@ public class GeminiLive extends AndroidNonvisibleComponent {
     try{
       int min=AudioRecord.getMinBufferSize(16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);
       final int size=Math.max(min,3200);
-      audioRecord=new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION,16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,size*2);
+      audioRecord=new AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION,16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,size*2);
+      if(echoCancellation && AcousticEchoCanceler.isAvailable()){
+        try{ echoCanceler=AcousticEchoCanceler.create(audioRecord.getAudioSessionId()); if(echoCanceler!=null) echoCanceler.setEnabled(true); }catch(Exception ignored){}
+      }
+      if(noiseSuppression && NoiseSuppressor.isAvailable()){
+        try{ noiseSuppressor=NoiseSuppressor.create(audioRecord.getAudioSessionId()); if(noiseSuppressor!=null) noiseSuppressor.setEnabled(true); }catch(Exception ignored){}
+      }
       if(audioRecord.getState()!=AudioRecord.STATE_INITIALIZED) throw new IOException("AudioRecord initialization failed");
       listening=true; audioRecord.startRecording();
       ui.post(new Runnable(){ public void run(){ ListeningStarted(); }});
@@ -366,6 +407,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
           while(listening && ready && audioRecord!=null){
             int n=audioRecord.read(buf,0,buf.length);
             if(n>0){
+              if(muteMicWhileSpeaking && assistantSpeaking) continue;
               byte[] chunk=new byte[n]; System.arraycopy(buf,0,chunk,0,n);
               JSONObject blob=new JSONObject().put("data",Base64.encodeToString(chunk,Base64.NO_WRAP)).put("mimeType","audio/pcm;rate=16000");
               sendFrame(new JSONObject().put("realtimeInput",new JSONObject().put("audio",blob)).toString());
@@ -374,6 +416,9 @@ public class GeminiLive extends AndroidNonvisibleComponent {
         }catch(Exception e){ if(listening) Error("Microphone: "+e.toString()); }
         finally{
           listening=false;
+          try{ if(echoCanceler!=null) echoCanceler.release(); }catch(Exception ignored){}
+          try{ if(noiseSuppressor!=null) noiseSuppressor.release(); }catch(Exception ignored){}
+          echoCanceler=null; noiseSuppressor=null;
           try{ if(audioRecord!=null) audioRecord.release(); }catch(Exception ignored){}
           audioRecord=null;
           ui.post(new Runnable(){ public void run(){ ListeningStopped(); }});
@@ -430,6 +475,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
 
   private void playPcm(byte[] pcm){
     if(!audioEnabled || pcm==null || pcm.length==0) return;
+    assistantSpeaking=true;
     ensureAudioTrack();
     synchronized(audioLock){
       if(audioTrack!=null) audioTrack.write(pcm,0,pcm.length);
