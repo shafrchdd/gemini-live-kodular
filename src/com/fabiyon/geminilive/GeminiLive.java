@@ -35,7 +35,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   public void Connect(final String apiKey){
     if(apiKey==null || apiKey.trim().isEmpty()){ Error("API key is empty"); return; }
     Disconnect();
-    new Thread(() -> {
+    new Thread(new Runnable() { public void run() {
       try {
         URI uri=new URI("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key="+apiKey.trim());
         socket=(SSLSocket)SSLSocketFactory.getDefault().createSocket(uri.getHost(),443);
@@ -49,12 +49,12 @@ public class GeminiLive extends AndroidNonvisibleComponent {
         String status=br.readLine(); if(status==null || !status.contains(" 101 ")) throw new IOException("WebSocket handshake failed: "+status);
         String line; while((line=br.readLine())!=null && !line.isEmpty()){}
         connected=true; fireConnected();
-        reader=new Thread(this::readLoop); reader.start();
+        reader=new Thread(new Runnable() { public void run() { readLoop(); }}); reader.start();
         JSONObject setup=new JSONObject(); JSONObject body=new JSONObject();
         body.put("model","models/"+model); setup.put("setup",body);
         sendFrame(setup.toString()); SetupSent(setup.toString());
       } catch(Exception e){ Error("Connect/setup: "+e.getMessage()); closeQuietly(); }
-    },"GeminiLive-connect").start();
+    }},"GeminiLive-connect").start();
   }
 
   @SimpleFunction public void SendText(String text){
@@ -79,10 +79,10 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   @SimpleEvent public void SetupComplete(){ EventDispatcher.dispatchEvent(this,"SetupComplete"); }
   @SimpleEvent public void RawMessage(String message){ EventDispatcher.dispatchEvent(this,"RawMessage",message); }
   @SimpleEvent public void TextReceived(String text){ EventDispatcher.dispatchEvent(this,"TextReceived",text); }
-  @SimpleEvent public void Error(String message){ ui.post(() -> EventDispatcher.dispatchEvent(this,"Error",message)); }
+  @SimpleEvent public void Error(String message){ ui.post(new Runnable() { public void run() { EventDispatcher.dispatchEvent(GeminiLive.this,"Error",message); }}); }
   @SimpleEvent public void Disconnected(String reason){ EventDispatcher.dispatchEvent(this,"Disconnected",reason); }
 
-  private void fireConnected(){ ui.post(this::Connected); }
+  private void fireConnected(){ ui.post(new Runnable() { public void run() { Connected(); }}); }
   private String makeKey(){ byte[] b=new byte[16]; new SecureRandom().nextBytes(b); return Base64.getEncoder().encodeToString(b); }
 
   private synchronized void sendFrame(String s) throws IOException {
@@ -116,7 +116,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
         }
       }
     } catch(Exception e){ if(connected) Error("Read: "+e.getMessage()); }
-    finally { boolean was=connected; closeQuietly(); if(was) ui.post(() -> Disconnected("Socket closed")); }
+    finally { boolean was=connected; closeQuietly(); if(was) ui.post(new Runnable() { public void run() { Disconnected("Socket closed"); }}); }
   }
 
   private int readByte() throws IOException { int x=in.read(); if(x<0) throw new EOFException(); return x; }
@@ -128,15 +128,15 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   }
 
   private void handleMessage(final String msg){
-    ui.post(() -> RawMessage(msg));
+    ui.post(new Runnable() { public void run() { RawMessage(msg); }});
     try {
       JSONObject j=new JSONObject(msg);
-      if(j.has("setupComplete")){ ready=true; ui.post(this::SetupComplete); return; }
+      if(j.has("setupComplete")){ ready=true; ui.post(new Runnable() { public void run() { SetupComplete(); }}); return; }
       if(j.has("serverContent")){
         JSONObject sc=j.getJSONObject("serverContent");
         if(sc.has("modelTurn")){
           org.json.JSONArray ps=sc.getJSONObject("modelTurn").optJSONArray("parts");
-          if(ps!=null) for(int i=0;i<ps.length();i++){ String t=ps.getJSONObject(i).optString("text",""); if(!t.isEmpty()) ui.post(() -> TextReceived(t)); }
+          if(ps!=null) for(int i=0;i<ps.length();i++){ String t=ps.getJSONObject(i).optString("text",""); if(!t.isEmpty()) final String textPart=t; ui.post(new Runnable() { public void run() { TextReceived(textPart); }}); }
         }
       }
     } catch(Exception ignored){}
