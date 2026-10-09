@@ -2,10 +2,12 @@ package com.fabiyon.geminilive;
 
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Build;
 import com.google.appinventor.components.annotations.*;
 import com.google.appinventor.components.common.ComponentCategory;
 import com.google.appinventor.components.runtime.*;
 import org.json.JSONObject;
+import org.json.JSONException;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import java.io.*;
@@ -35,7 +37,7 @@ import javax.net.ssl.SSLParameters;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
-@DesignerComponent(version=4, description="Direct Gemini Live WebSocket client for Kodular. No proxy server required.", category=ComponentCategory.EXTENSION, nonVisible=true, iconName="")
+@DesignerComponent(version=5, description="Direct Gemini Live WebSocket client for Kodular. No proxy server required.", category=ComponentCategory.EXTENSION, nonVisible=true, iconName="")
 @SimpleObject(external=true)
 @UsesPermissions(permissionNames="android.permission.INTERNET, android.permission.RECORD_AUDIO")
 public class GeminiLive extends AndroidNonvisibleComponent {
@@ -314,7 +316,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   public void Volume(int value){
     if(value<0)value=0; if(value>100)value=100;
     volume=value/100f;
-    synchronized(audioLock){ if(audioTrack!=null) audioTrack.setStereoVolume(volume,volume); }
+    synchronized(audioLock){ if(audioTrack!=null && audioTrack.getState()==AudioTrack.STATE_INITIALIZED) applyVolume(audioTrack); }
   }
 
   @SimpleFunction(description="Immediately stop and flush buffered Gemini audio.")
@@ -457,7 +459,9 @@ public class GeminiLive extends AndroidNonvisibleComponent {
           ui.post(new Runnable(){ public void run(){ TurnComplete(); }});
         }
       }
-    } catch(Exception e){ Error("Parse server message: "+e.toString()); }
+    } catch(JSONException e){
+      if(debugRawMessages) Error("Invalid server JSON: "+e.toString());
+    } catch(Exception e){ Error("Handle server message: "+e.toString()); }
   }
 
   private void startMicInternal(){
@@ -539,6 +543,11 @@ public class GeminiLive extends AndroidNonvisibleComponent {
     }},"GeminiLive-catalog").start();
   }
 
+  private void applyVolume(AudioTrack track){
+    if(Build.VERSION.SDK_INT>=21) track.setVolume(volume);
+    else track.setStereoVolume(volume,volume);
+  }
+
   private void ensureAudioTrack(){
     synchronized(audioLock){
       if(audioTrack==null){
@@ -546,8 +555,13 @@ public class GeminiLive extends AndroidNonvisibleComponent {
         int buffer=Math.max(min,9600);
         audioTrack=new AudioTrack(AudioManager.STREAM_MUSIC,24000,AudioFormat.CHANNEL_OUT_MONO,
           AudioFormat.ENCODING_PCM_16BIT,buffer,AudioTrack.MODE_STREAM);
-        audioTrack.setStereoVolume(volume,volume);
+        if(audioTrack.getState()!=AudioTrack.STATE_INITIALIZED){
+          audioTrack.release(); audioTrack=null;
+          throw new IllegalStateException("AudioTrack failed to initialize");
+        }
+        applyVolume(audioTrack);
       }
+      if(audioTrack.getState()!=AudioTrack.STATE_INITIALIZED) throw new IllegalStateException("AudioTrack not initialized");
       if(audioTrack.getPlayState()!=AudioTrack.PLAYSTATE_PLAYING) audioTrack.play();
     }
   }
@@ -562,7 +576,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
           while(generation==playbackGeneration && !Thread.currentThread().isInterrupted()){
             try{
               byte[] chunk=playQueue.poll(250,TimeUnit.MILLISECONDS);
-              if(chunk==null) continue;
+              if(chunk==null){ if(playQueue.isEmpty()) assistantSpeaking=false; continue; }
               if(!audioEnabled) continue;
               ensureAudioTrack();
               AudioTrack track;
