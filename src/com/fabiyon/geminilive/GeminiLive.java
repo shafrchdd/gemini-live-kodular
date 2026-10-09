@@ -25,6 +25,10 @@ import com.google.appinventor.components.runtime.PermissionResultHandler;
 import java.net.URL;
 import java.net.HttpURLConnection;
 import java.util.ArrayList;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import java.io.File;
+import java.io.FileInputStream;
 
 @DesignerComponent(version=1, description="Direct Gemini Live WebSocket client for Kodular. No proxy server required.", category=ComponentCategory.EXTENSION, nonVisible=true, iconName="")
 @SimpleObject(external=true)
@@ -39,6 +43,8 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   private String apiKey="";
   private final org.json.JSONArray functionDeclarations=new org.json.JSONArray();
   private volatile boolean listening=false;
+  private volatile int micGeneration=0;
+  private final Object micLock=new Object();
   private AudioRecord audioRecord;
   private Thread micThread;
   private AcousticEchoCanceler echoCanceler;
@@ -132,28 +138,38 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   @SimpleFunction public boolean IsEchoCancellationAvailable(){ return AcousticEchoCanceler.isAvailable(); }
   @SimpleFunction public boolean IsNoiseSuppressionAvailable(){ return NoiseSuppressor.isAvailable(); }
 
-  @SimpleFunction(description="Start low-latency microphone streaming (16 kHz mono PCM16) to Gemini. Android microphone permission is requested automatically.")
+  @SimpleFunction(description="Start microphone only when explicitly requested.")
   public void StartListening(){
-    if(!ready){ Error("Gemini is not ready."); return; }
+    if(!ready){ ModeError("VOICE","NOT_READY","Wait for SetupComplete"); return; }
+    synchronized(micLock){ if(listening) return; }
     form.askPermission("android.permission.RECORD_AUDIO",new PermissionResultHandler(){
       public void HandlePermissionResponse(String permission,boolean granted){
-        if(granted) startMicInternal(); else Error("Microphone permission denied");
+        if(!granted){ ModeError("VOICE","PERMISSION_DENIED","Microphone permission denied"); return; }
+        startMicInternal();
       }
     });
   }
 
-  @SimpleFunction(description="Stop microphone streaming and signal end of the audio stream.")
+  @SimpleFunction(description="Stop the microphone without disconnecting Gemini. Safe to call repeatedly.")
   public void StopListening(){
-    listening=false; assistantSpeaking=false;
-    try{ if(audioRecord!=null) audioRecord.stop(); }catch(Exception ignored){}
-    try{ if(echoCanceler!=null) echoCanceler.release(); }catch(Exception ignored){}
-    try{ if(noiseSuppressor!=null) noiseSuppressor.release(); }catch(Exception ignored){}
-    echoCanceler=null; noiseSuppressor=null;
-    audioRecord=null;
-    if(ready) new Thread(new Runnable(){ public void run(){
+    final AudioRecord recorder;
+    final boolean wasListening;
+    synchronized(micLock){
+      wasListening=listening;
+      listening=false;
+      micGeneration++;
+      recorder=audioRecord;
+    }
+    if(recorder!=null) try{ recorder.stop(); }catch(Exception ignored){}
+    if(wasListening && ready) new Thread(new Runnable(){ public void run(){
       try{ sendFrame(new JSONObject().put("realtimeInput",new JSONObject().put("audioStreamEnd",true)).toString()); }
-      catch(Exception e){ Error("StopListening: "+e.toString()); }
+      catch(Exception e){ ModeError("VOICE","STREAM_END_FAILED",e.toString()); }
     }},"GeminiLive-audioEnd").start();
+  }
+
+  @SimpleEvent public void ModeError(String mode,String code,String message){
+    final String m=mode,c=code,t=message;
+    ui.post(new Runnable(){ public void run(){ EventDispatcher.dispatchEvent(GeminiLive.this,"ModeError",m,c,t); }});
   }
 
   @SimpleFunction public boolean IsListening(){ return listening; }
@@ -208,7 +224,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   }
 
   @SimpleFunction public void SendText(final String text){
-    if(!ready){ Error("Gemini is not ready. Wait for SetupComplete."); return; }
+    if(!ready){ ModeError("TEXT","NOT_READY","Wait for SetupComplete"); return; }
     new Thread(new Runnable() { public void run() {
       try {
         JSONObject part=new JSONObject().put("text",text);
@@ -221,9 +237,35 @@ public class GeminiLive extends AndroidNonvisibleComponent {
       } catch(Exception e){
         String detail=e.toString();
         if(e.getMessage()!=null) detail += " | " + e.getMessage();
-        Error("SendText: "+detail);
+        ModeError("TEXT","SEND_FAILED",detail);
       }
     }},"GeminiLive-sendText").start();
+  }
+
+  @SimpleFunction(description="Send prompt plus image file path; microphone is not started.")
+  public void SendTextWithImage(final String prompt,final String imagePath){
+    if(!ready){ ModeError("IMAGE","NOT_READY","Wait for SetupComplete"); return; }
+    if(imagePath==null || imagePath.trim().isEmpty()){ ModeError("IMAGE","INVALID_PATH","Image path is empty"); return; }
+    new Thread(new Runnable(){ public void run(){
+      try{
+        String clean=imagePath.startsWith("file://")?imagePath.substring(7):imagePath;
+        File file=new File(clean);
+        if(!file.isFile()) throw new IOException("Image file not found: "+clean);
+        Bitmap bmp=BitmapFactory.decodeFile(clean);
+        if(bmp==null) throw new IOException("Unsupported image or unreadable file");
+        int max=Math.max(bmp.getWidth(),bmp.getHeight());
+        if(max>1024){ float scale=1024f/max; Bitmap small=Bitmap.createScaledBitmap(bmp,Math.max(1,(int)(bmp.getWidth()*scale)),Math.max(1,(int)(bmp.getHeight()*scale)),true); bmp.recycle(); bmp=small; }
+        ByteArrayOutputStream bytes=new ByteArrayOutputStream();
+        if(!bmp.compress(Bitmap.CompressFormat.JPEG,85,bytes)) throw new IOException("Image encoding failed");
+        bmp.recycle();
+        JSONObject image=new JSONObject().put("inlineData",new JSONObject().put("mimeType","image/jpeg").put("data",Base64.encodeToString(bytes.toByteArray(),Base64.NO_WRAP)));
+        org.json.JSONArray parts=new org.json.JSONArray();
+        parts.put(new JSONObject().put("text",prompt==null?"":prompt)); parts.put(image);
+        JSONObject content=new JSONObject().put("role","user").put("parts",parts);
+        JSONObject request=new JSONObject().put("clientContent",new JSONObject().put("turns",new org.json.JSONArray().put(content)).put("turnComplete",true));
+        sendFrame(request.toString());
+      }catch(Exception e){ ModeError("IMAGE","SEND_FAILED",e.toString()); }
+    }},"GeminiLive-image").start();
   }
 
   @SimpleProperty(category=PropertyCategory.BEHAVIOR, description="Play Gemini PCM audio responses through the device speaker.")
@@ -387,44 +429,44 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   }
 
   private void startMicInternal(){
-    if(listening) return;
+    if(!ready) return;
+    final int generation;
+    synchronized(micLock){ if(listening) return; listening=true; generation=++micGeneration; }
     try{
       int min=AudioRecord.getMinBufferSize(16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);
+      if(min<0) throw new IOException("Unsupported microphone format: "+min);
       final int size=Math.max(min,3200);
-      audioRecord=new AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION,16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,size*2);
-      if(echoCancellation && AcousticEchoCanceler.isAvailable()){
-        try{ echoCanceler=AcousticEchoCanceler.create(audioRecord.getAudioSessionId()); if(echoCanceler!=null) echoCanceler.setEnabled(true); }catch(Exception ignored){}
-      }
-      if(noiseSuppression && NoiseSuppressor.isAvailable()){
-        try{ noiseSuppressor=NoiseSuppressor.create(audioRecord.getAudioSessionId()); if(noiseSuppressor!=null) noiseSuppressor.setEnabled(true); }catch(Exception ignored){}
-      }
-      if(audioRecord.getState()!=AudioRecord.STATE_INITIALIZED) throw new IOException("AudioRecord initialization failed");
-      listening=true; audioRecord.startRecording();
-      ui.post(new Runnable(){ public void run(){ ListeningStarted(); }});
+      final AudioRecord rec=new AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION,16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,size*2);
+      if(rec.getState()!=AudioRecord.STATE_INITIALIZED){ rec.release(); throw new IOException("Microphone initialization failed"); }
+      synchronized(micLock){ if(generation!=micGeneration || !listening){ rec.release(); return; } audioRecord=rec; }
+      if(echoCancellation && AcousticEchoCanceler.isAvailable()) try{ echoCanceler=AcousticEchoCanceler.create(rec.getAudioSessionId()); if(echoCanceler!=null)echoCanceler.setEnabled(true); }catch(Exception ignored){}
+      if(noiseSuppression && NoiseSuppressor.isAvailable()) try{ noiseSuppressor=NoiseSuppressor.create(rec.getAudioSessionId()); if(noiseSuppressor!=null)noiseSuppressor.setEnabled(true); }catch(Exception ignored){}
+      rec.startRecording();
+      ui.post(new Runnable(){ public void run(){ if(listening && generation==micGeneration) ListeningStarted(); }});
       micThread=new Thread(new Runnable(){ public void run(){
         byte[] buf=new byte[size];
         try{
-          while(listening && ready && audioRecord!=null){
-            int n=audioRecord.read(buf,0,buf.length);
-            if(n>0){
-              if(muteMicWhileSpeaking && assistantSpeaking) continue;
-              byte[] chunk=new byte[n]; System.arraycopy(buf,0,chunk,0,n);
-              JSONObject blob=new JSONObject().put("data",Base64.encodeToString(chunk,Base64.NO_WRAP)).put("mimeType","audio/pcm;rate=16000");
-              sendFrame(new JSONObject().put("realtimeInput",new JSONObject().put("audio",blob)).toString());
-            }
+          while(listening && ready && generation==micGeneration){
+            int n=rec.read(buf,0,buf.length);
+            if(n<0){ if(listening) ModeError("VOICE","AUDIO_READ_FAILED","AudioRecord returned "+n); break; }
+            if(n==0 || (muteMicWhileSpeaking && assistantSpeaking)) continue;
+            byte[] chunk=new byte[n]; System.arraycopy(buf,0,chunk,0,n);
+            JSONObject blob=new JSONObject().put("data",Base64.encodeToString(chunk,Base64.NO_WRAP)).put("mimeType","audio/pcm;rate=16000");
+            if(listening && generation==micGeneration) sendFrame(new JSONObject().put("realtimeInput",new JSONObject().put("audio",blob)).toString());
           }
-        }catch(Exception e){ if(listening) Error("Microphone: "+e.toString()); }
+        }catch(Exception e){ if(listening && generation==micGeneration) ModeError("VOICE","MIC_FAILED",e.toString()); }
         finally{
-          listening=false;
-          try{ if(echoCanceler!=null) echoCanceler.release(); }catch(Exception ignored){}
-          try{ if(noiseSuppressor!=null) noiseSuppressor.release(); }catch(Exception ignored){}
-          echoCanceler=null; noiseSuppressor=null;
-          try{ if(audioRecord!=null) audioRecord.release(); }catch(Exception ignored){}
-          audioRecord=null;
+          try{ rec.stop(); }catch(Exception ignored){}
+          try{ rec.release(); }catch(Exception ignored){}
+          synchronized(micLock){
+            if(audioRecord==rec) audioRecord=null;
+            if(generation==micGeneration) listening=false;
+          }
           ui.post(new Runnable(){ public void run(){ ListeningStopped(); }});
         }
-      }},"GeminiLive-microphone"); micThread.start();
-    }catch(Exception e){ listening=false; Error("StartListening: "+e.toString()); }
+      }},"GeminiLive-microphone");
+      micThread.start();
+    }catch(Exception e){ synchronized(micLock){ if(generation==micGeneration)listening=false; } ModeError("VOICE","START_FAILED",e.toString()); }
   }
 
   private void fetchCatalog(final String key,final boolean models){
@@ -500,8 +542,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   }
 
   private synchronized void closeQuietly(){
-    listening=false;
-    try{ if(audioRecord!=null) audioRecord.stop(); }catch(Exception ignored){}
+    StopListening();
     ready=false; connected=false;
     releaseAudio();
     try{ if(socket!=null) socket.close(); }catch(Exception ignored){}
