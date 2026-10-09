@@ -35,7 +35,7 @@ import javax.net.ssl.SSLParameters;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
-@DesignerComponent(version=3, description="Direct Gemini Live WebSocket client for Kodular. No proxy server required.", category=ComponentCategory.EXTENSION, nonVisible=true, iconName="")
+@DesignerComponent(version=4, description="Direct Gemini Live WebSocket client for Kodular. No proxy server required.", category=ComponentCategory.EXTENSION, nonVisible=true, iconName="")
 @SimpleObject(external=true)
 @UsesPermissions(permissionNames="android.permission.INTERNET, android.permission.RECORD_AUDIO")
 public class GeminiLive extends AndroidNonvisibleComponent {
@@ -46,7 +46,8 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   private String voice="Puck";
   private String systemInstruction="";
   private String apiKey="";
-  private final org.json.JSONArray functionDeclarations=new org.json.JSONArray();
+  private org.json.JSONArray functionDeclarations=new org.json.JSONArray();
+  private final Object funcLock=new Object();
   private volatile boolean listening=false;
   private volatile int micGeneration=0;
   private final Object micLock=new Object();
@@ -102,14 +103,14 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   @SimpleEvent public void VoicesLoaded(YailList voices){ EventDispatcher.dispatchEvent(this,"VoicesLoaded",voices); }
 
   @SimpleFunction(description="Remove all function declarations that will be sent on the next connection.")
-  public void ClearFunctions(){ while(functionDeclarations.length()>0) functionDeclarations.remove(0); }
+  public void ClearFunctions(){ synchronized(funcLock){ functionDeclarations=new org.json.JSONArray(); } }
 
   @SimpleFunction(description="Add a Gemini function. parametersJson must be a JSON Schema object, for example {\"type\":\"object\",\"properties\":{}}. Add functions before Connect.")
   public void AddFunction(String name,String description,String parametersJson){
     try{
       JSONObject d=new JSONObject().put("name",name).put("description",description==null?"":description);
       if(parametersJson!=null && !parametersJson.trim().isEmpty()) d.put("parameters",new JSONObject(parametersJson));
-      functionDeclarations.put(d);
+      synchronized(funcLock){ functionDeclarations.put(d); }
     }catch(Exception e){ Error("AddFunction: "+e.toString()); }
   }
 
@@ -177,9 +178,9 @@ public class GeminiLive extends AndroidNonvisibleComponent {
       recorder=audioRecord;
     }
     if(recorder!=null) try{ recorder.stop(); }catch(Exception ignored){}
-    if(wasListening && ready) new Thread(new Runnable(){ public void run(){
-      try{ sendFrame(new JSONObject().put("realtimeInput",new JSONObject().put("audioStreamEnd",true)).toString()); }
-      catch(Exception e){ ModeError("VOICE","STREAM_END_FAILED",e.toString()); }
+    if(wasListening && ready && connected) new Thread(new Runnable(){ public void run(){
+      try{ if(ready && connected) sendFrame(new JSONObject().put("realtimeInput",new JSONObject().put("audioStreamEnd",true)).toString()); }
+      catch(IOException ignored){} catch(Exception e){ if(ready && connected) ModeError("VOICE","STREAM_END_FAILED",e.toString()); }
     }},"GeminiLive-audioEnd").start();
   }
 
@@ -199,6 +200,8 @@ public class GeminiLive extends AndroidNonvisibleComponent {
     Disconnect();
     this.apiKey=apiKey.trim();
     final int mySession=session;
+    final String functionsSnapshot;
+    synchronized(funcLock){ functionsSnapshot=functionDeclarations.toString(); }
     new Thread(new Runnable() { public void run() {
       try {
         URI uri=new URI("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key="+apiKey.trim());
@@ -224,7 +227,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
         connected=true; fireConnected();
         reader=new Thread(new Runnable() { public void run() { readLoop(mySession); }}); reader.start();
         JSONObject setup=new JSONObject(); JSONObject body=new JSONObject();
-        body.put("model","models/"+model);
+        body.put("model",model.startsWith("models/")?model:"models/"+model);
         org.json.JSONArray modalities=new org.json.JSONArray(); modalities.put("AUDIO");
         JSONObject prebuilt=new JSONObject(); prebuilt.put("voiceName",voice);
         JSONObject voiceConfig=new JSONObject(); voiceConfig.put("prebuiltVoiceConfig",prebuilt);
@@ -235,8 +238,8 @@ public class GeminiLive extends AndroidNonvisibleComponent {
           JSONObject sip=new JSONObject().put("text",systemInstruction);
           body.put("systemInstruction",new JSONObject().put("parts",new org.json.JSONArray().put(sip)));
         }
-        if(functionDeclarations.length()>0){
-          JSONObject tool=new JSONObject().put("functionDeclarations",new org.json.JSONArray(functionDeclarations.toString()));
+        if(!"[]".equals(functionsSnapshot)){
+          JSONObject tool=new JSONObject().put("functionDeclarations",new org.json.JSONArray(functionsSnapshot));
           body.put("tools",new org.json.JSONArray().put(tool));
         }
         body.put("inputAudioTranscription",new JSONObject());
