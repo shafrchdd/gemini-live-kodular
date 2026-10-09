@@ -203,7 +203,8 @@ public class GeminiLive extends AndroidNonvisibleComponent {
       try {
         URI uri=new URI("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key="+apiKey.trim());
         Socket plain=new Socket(); plain.connect(new InetSocketAddress(uri.getHost(),443),10000);
-        SSLSocket fresh=(SSLSocket)SSLSocketFactory.getDefault().createSocket(plain,uri.getHost(),443,true);
+        SSLSocketFactory factory=(SSLSocketFactory)SSLSocketFactory.getDefault();
+        SSLSocket fresh=(SSLSocket)factory.createSocket(plain,uri.getHost(),443,true);
         SSLParameters params=fresh.getSSLParameters(); params.setEndpointIdentificationAlgorithm("HTTPS"); fresh.setSSLParameters(params);
         fresh.setSoTimeout(20000); fresh.startHandshake();
         if(mySession!=session){ fresh.close(); return; }
