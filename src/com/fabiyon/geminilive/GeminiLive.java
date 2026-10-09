@@ -37,7 +37,7 @@ import javax.net.ssl.SSLParameters;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
-@DesignerComponent(version=5, description="Direct Gemini Live WebSocket client for Kodular. No proxy server required.", category=ComponentCategory.EXTENSION, nonVisible=true, iconName="")
+@DesignerComponent(version=6, description="Direct Gemini Live WebSocket client for Kodular. No proxy server required.", category=ComponentCategory.EXTENSION, nonVisible=true, iconName="")
 @SimpleObject(external=true)
 @UsesPermissions(permissionNames="android.permission.INTERNET, android.permission.RECORD_AUDIO")
 public class GeminiLive extends AndroidNonvisibleComponent {
@@ -59,6 +59,9 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   private volatile boolean noiseSuppression=true;
   private volatile boolean muteMicWhileSpeaking=false;
   private volatile boolean assistantSpeaking=false;
+  private volatile long playbackEndMs=0;
+  private volatile Socket connectingSocket;
+  private static final int MAX_MESSAGE_BYTES=16*1024*1024;
   private volatile boolean audioEnabled=true;
   private volatile float volume=1.0f;
   private AudioTrack audioTrack;
@@ -207,13 +210,16 @@ public class GeminiLive extends AndroidNonvisibleComponent {
     new Thread(new Runnable() { public void run() {
       try {
         URI uri=new URI("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key="+apiKey.trim());
-        Socket plain=new Socket(); plain.connect(new InetSocketAddress(uri.getHost(),443),10000);
+        Socket plain=new Socket();
+        synchronized(connectionLock){ if(mySession!=session) return; connectingSocket=plain; }
+        plain.connect(new InetSocketAddress(uri.getHost(),443),10000);
         SSLSocketFactory factory=(SSLSocketFactory)SSLSocketFactory.getDefault();
         SSLSocket fresh=(SSLSocket)factory.createSocket(plain,uri.getHost(),443,true);
+        synchronized(connectionLock){ if(mySession!=session){ fresh.close(); return; } connectingSocket=fresh; }
         SSLParameters params=fresh.getSSLParameters(); params.setEndpointIdentificationAlgorithm("HTTPS"); fresh.setSSLParameters(params);
         fresh.setSoTimeout(20000); fresh.startHandshake();
         if(mySession!=session){ fresh.close(); return; }
-        socket=fresh; in=fresh.getInputStream(); out=fresh.getOutputStream();
+        synchronized(connectionLock){ if(mySession!=session){ fresh.close(); return; } socket=fresh; connectingSocket=null; in=fresh.getInputStream(); out=fresh.getOutputStream(); }
         String key=makeKey();
         String req="GET "+uri.getRawPath()+"?"+uri.getRawQuery()+" HTTP/1.1\r\n"+
           "Host: "+uri.getHost()+"\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"+
@@ -371,6 +377,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
         // (opcode 2) WebSocket frames. The Python reference client receives
         // setupComplete/serverContent as bytes, so decode binary JSON as UTF-8.
         if(opcode==1 || opcode==2 || opcode==0){
+          if((long)fragmented.size()+data.length>MAX_MESSAGE_BYTES) throw new IOException("Fragmented message too large");
           fragmented.write(data);
           if(fin){ handleMessage(new String(fragmented.toByteArray(),StandardCharsets.UTF_8)); fragmented.reset(); }
         }
@@ -386,10 +393,9 @@ public class GeminiLive extends AndroidNonvisibleComponent {
       int x=in.read(); if(x<0) throw new EOFException("EOF during WebSocket handshake");
       b.write(x);
       if(state==0) state=(x=='\r')?1:0;
-      else if(state==1) state=(x=='\n')?2:0;
+      else if(state==1) state=(x=='\n')?2:(x=='\r'?1:0);
       else if(state==2) state=(x=='\r')?3:0;
-      else if(state==3 && x=='\n') break;
-      else state=0;
+      else if(state==3){ if(x=='\n') break; state=(x=='\r')?1:0; }
     }
     if(state!=3) throw new IOException("WebSocket response headers too large");
     return new String(b.toByteArray(),StandardCharsets.US_ASCII);
@@ -454,7 +460,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
           final String tx=tr.optString("text","");
           if(!tx.isEmpty()) ui.post(new Runnable(){ public void run(){ OutputTranscription(tx); }});
         }
-        if(sc.optBoolean("interrupted",false)){ assistantSpeaking=false; flushAudio(); }
+        if(sc.optBoolean("interrupted",false)){ assistantSpeaking=false; new Thread(new Runnable(){ public void run(){ flushAudio(); } },"GeminiLive-interrupt").start(); }
         if(sc.optBoolean("turnComplete",false)){
           ui.post(new Runnable(){ public void run(){ TurnComplete(); }});
         }
@@ -494,6 +500,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
           }
         }catch(Exception e){ if(listening && generation==micGeneration) ModeError("VOICE","MIC_FAILED",e.toString()); }
         finally{
+          if(listening && ready && connected && generation==micGeneration){ try{ sendFrame(new JSONObject().put("realtimeInput",new JSONObject().put("audioStreamEnd",true)).toString()); }catch(Exception ignored){} }
           try{ rec.stop(); }catch(Exception ignored){}
           try{ rec.release(); }catch(Exception ignored){}
           if(echo!=null) try{ echo.release(); }catch(Exception ignored){}
@@ -576,13 +583,13 @@ public class GeminiLive extends AndroidNonvisibleComponent {
           while(generation==playbackGeneration && !Thread.currentThread().isInterrupted()){
             try{
               byte[] chunk=playQueue.poll(250,TimeUnit.MILLISECONDS);
-              if(chunk==null){ if(playQueue.isEmpty()) assistantSpeaking=false; continue; }
+              if(chunk==null){ if(playQueue.isEmpty() && android.os.SystemClock.elapsedRealtime()>=playbackEndMs) assistantSpeaking=false; continue; }
               if(!audioEnabled) continue;
               ensureAudioTrack();
               AudioTrack track;
               synchronized(audioLock){ track=audioTrack; }
-              if(track!=null) track.write(chunk,0,chunk.length);
-              if(playQueue.isEmpty()) assistantSpeaking=false;
+              if(track!=null){ int written=track.write(chunk,0,chunk.length); if(written>0){ long now=android.os.SystemClock.elapsedRealtime(); playbackEndMs=Math.max(now,playbackEndMs)+(written*1000L/48000L); } }
+              if(playQueue.isEmpty() && android.os.SystemClock.elapsedRealtime()>=playbackEndMs) assistantSpeaking=false;
             }catch(InterruptedException e){ break; }
             catch(Exception e){ Error("Playback: "+e.toString()); }
           }
@@ -591,8 +598,8 @@ public class GeminiLive extends AndroidNonvisibleComponent {
       }
     }
     if(!playQueue.offer(pcm)){
-      playQueue.clear();
-      Error("Audio playback queue overflow; dropped buffered audio");
+      playQueue.poll();
+      Error("Audio playback queue overflow; dropped oldest chunk");
       playQueue.offer(pcm);
     }
   }
@@ -610,7 +617,7 @@ public class GeminiLive extends AndroidNonvisibleComponent {
   private void releaseAudio(){
     playQueue.clear();
     assistantSpeaking=false;
-    playbackGeneration++;
+    playbackGeneration++; playbackEndMs=0;
     Thread old=playThread; playThread=null;
     if(old!=null) old.interrupt();
     synchronized(audioLock){
@@ -623,13 +630,15 @@ public class GeminiLive extends AndroidNonvisibleComponent {
 
   private void closeQuietly(){
     final SSLSocket oldSocket;
+    final Socket pendingSocket;
     synchronized(connectionLock){
       session++;
       ready=false; connected=false;
-      oldSocket=socket; socket=null; in=null; out=null;
+      oldSocket=socket; pendingSocket=connectingSocket; connectingSocket=null; socket=null; in=null; out=null;
     }
     StopListening();
     releaseAudio();
+    if(pendingSocket!=null) new Thread(new Runnable(){ public void run(){ try{ pendingSocket.close(); }catch(Exception ignored){} } },"GeminiLive-closePending").start();
     if(oldSocket!=null) new Thread(new Runnable(){ public void run(){
       try{ oldSocket.close(); }catch(Exception ignored){}
     }},"GeminiLive-close").start();
