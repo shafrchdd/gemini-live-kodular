@@ -30,7 +30,7 @@ import android.graphics.BitmapFactory;
 import java.io.File;
 import java.io.FileInputStream;
 
-@DesignerComponent(version=1, description="Direct Gemini Live WebSocket client for Kodular. No proxy server required.", category=ComponentCategory.EXTENSION, nonVisible=true, iconName="")
+@DesignerComponent(version=2, description="Direct Gemini Live WebSocket client for Kodular. No proxy server required.", category=ComponentCategory.EXTENSION, nonVisible=true, iconName="")
 @SimpleObject(external=true)
 @UsesPermissions(permissionNames="android.permission.INTERNET, android.permission.RECORD_AUDIO")
 public class GeminiLive extends AndroidNonvisibleComponent {
