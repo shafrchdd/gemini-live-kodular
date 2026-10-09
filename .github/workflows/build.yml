@@ -2,7 +2,7 @@ name: Build Gemini Live AIX
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, 'fix/three-input-modes-20261009' ]
   workflow_dispatch:
 
 jobs:
